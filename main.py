@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+from kubernetes import client, config, watch
+from contextlib import contextmanager
+from subprocess import Popen, PIPE
+import signal 
+import re
+import os
+from pathlib import Path
+import tempfile 
+import sys
+import time
+# Namespace in which to whatch for new CE pods.
+NAMESPACE = "osg"
+# Label selector to filter for CE pods.
+LABEL_SELECTOR = "app.kubernetes.io/part-of=osg-hosted-ce"
+# Username to use when SSHing to the CE pods.
+CE_USER="sshd-user"
+# Extract the socket name from the stdout of ssh-agent
+SSH_AUTH_SOCK_RE = re.compile(r'SSH_AUTH_SOCK=([^;]*);')
+# Extract the agent PID from the stdout of ssh-agent
+SSH_AGENT_PID_RE = re.compile(r'SSH_AGENT_PID=([^;]*);')
+# Extract the "instance" from a pod name ("osg-hosted-ce-<instance-name>-<replicaset-id>-<pod-id>")
+POD_NAME_CE_INSTANCE_RE = re.compile(r'osg-hosted-ce-(.*)-[a-z0-9]*-[a-z0-9]*')
+
+# SSH key root path
+SSH_KEY_ROOT = Path.home() / 'scratch' / 'yubikey'
+
+def get_v1_client() -> client.CoreV1Api:
+    """ Get an API client for the K8s API pointed at Tiger. """
+    k8s_config = client.Configuration()
+    config.load_kube_config(client_configuration=k8s_config)
+
+    # TODO why doesn't load_kube_config honor the CA cert in the kubeconfig file? For now, just disable SSL verification.
+    k8s_config.verify_ssl = False
+    api_client = client.ApiClient(configuration=k8s_config)
+    v1 = client.CoreV1Api(api_client=api_client)
+    return v1
+
+v1 = get_v1_client()
+
+@contextmanager
+def port_forward_pod(pod_name: str, namespace: str, local_port: int, remote_port: int):
+    """ Port-forward the given pod's remote port to a local port within a context. """
+    # TODO : Port-forwarding is non-trivial in the native Python API, for now shell out to kubectl.
+    cmd = ["kubectl", "-n", namespace, "port-forward", f"pod/{pod_name}", f"{local_port}:{remote_port}"]
+    proc = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+    time.sleep(2) # Wait a moment for the port-forward to be established. TODO find a more robust way to do this.
+    try:
+        yield
+    finally:        
+        proc.terminate()
+
+@contextmanager
+def ssh_agent_session(ssh_key_paths: str):
+    """ Run the context within an eval $(ssh-agent), closing the agent at the end """
+    ssh_agent_out, ssh_agent_err = Popen('ssh-agent', stdout=PIPE).communicate()
+    socket_line, pid_line, *_ = [l.decode() for l in ssh_agent_out.splitlines()]
+
+    socket_match = SSH_AUTH_SOCK_RE.search(socket_line)
+    pid_match = SSH_AGENT_PID_RE.search(pid_line)
+    if not socket_match or not pid_match:
+        raise RuntimeError(f"Unexpected ssh-agent output: {ssh_agent_out.decode()}")
+
+    os.environ['SSH_AUTH_SOCK'] = socket_match[1]
+    os.environ['SSH_AGENT_PID'] = pid_match[1]
+
+    try:
+        for ssh_key_path in ssh_key_paths.split(','):
+            Popen(['ssh-add', SSH_KEY_ROOT / ssh_key_path]).wait()
+        yield
+    finally:
+        os.kill(int(os.environ['SSH_AGENT_PID']), signal.SIGTERM)
+
+@contextmanager
+def temporary_known_hosts(host_key: str):
+    """ Create a temporary known_hosts file containing the given host key, and set the environment variable to point to it. """
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(b'localhost ' + host_key.encode())
+        f.close()
+        yield f.name
+
+
+def get_ssh_host_key(pod_name: str, namespace: str) -> str:
+    """ Get the SSH host key for the given pod. """
+    instance_name = POD_NAME_CE_INSTANCE_RE.match(pod_name).group(1)
+    configmap_name = f"{instance_name}-ssh-host-pubkey"
+    configmap = v1.read_namespaced_config_map(configmap_name, namespace)
+    return configmap.data['ssh_host_rsa_key.pub']
+
+def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
+    """ SSH to the given pod using the provided SSH keys. """
+    # Port-forward the pod's SSH port to a local port.
+    host_key = get_ssh_host_key(pod_name, namespace)
+    print(f"SSH host key for pod {pod_name}: {host_key}")
+
+    # Create contexts for ssh'ing:
+    # - A port-forward to the pod's SSH port
+    # - An ssh-agent session with the provided keys loaded
+    # - A temporary known_hosts file containing the pod's SSH host key
+    with port_forward_pod(pod_name, namespace, local_port=2222, remote_port=22), \
+         ssh_agent_session(ssh_keys), \
+         temporary_known_hosts(host_key) as known_hosts_path:
+        print("Port forwarding established, SSHing to pod...")
+        # TODO encode as many of these flags as possible into an ssh config file?
+        cmd = ['ssh', 
+               '-o', f'UserKnownHostsFile={known_hosts_path}', 
+               '-o', 'ForwardAgent=yes',
+               '-o', 'IdentitiesOnly=yes',
+               '-o', f'IdentityFile={SSH_KEY_ROOT}/{ssh_keys.split(",")[0]}',
+               '-p', '2222', f'{CE_USER}@localhost',
+               "echo 'hello world!'"]
+        Popen(cmd).wait()
+    
+    print("SSH session complete.")
+
+def main():
+    """ Main event loop to watch for new CE pods and SSH to them when they are ready. """
+
+    print("Listing pods in the default namespace:")
+    w = watch.Watch()
+    for event in w.stream(v1.list_namespaced_pod, namespace="osg", label_selector="app.kubernetes.io/part-of=osg-hosted-ce"):
+        obj = event['object']
+        print("Event: %s %s %s" % (
+            event['type'],
+            obj.kind,
+            obj.metadata.name)
+        )
+        if obj.status and obj.status.container_statuses:
+            running_states = [k.state.running for k in obj.status.container_statuses]
+            if all(running_states):
+                print(f"All containers in pod {obj.metadata.name} are running!")
+                print(f"Keys to use: {obj.metadata.annotations.get('osg-htc.org/ssh-keys')}")
+                ssh_to_pod(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
+
+
+if __name__ == "__main__":
+    main()
