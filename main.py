@@ -14,6 +14,10 @@ import tempfile
 import sys
 import time
 import socket
+import logging
+
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+logger = logging.getLogger(__name__)
 
 # Constants for the script, configured via env
 
@@ -24,7 +28,7 @@ LABEL_SELECTOR = os.environ.get("CE_LABEL_SELECTOR", "app.kubernetes.io/part-of=
 # Username to use when SSHing to the CE pods.
 CE_USER = os.environ.get("CE_SSH_USER", "sshd-user")
 # SSH key root path
-SSH_KEY_ROOT = os.environ.get("CE_SSH_KEY_ROOT", str(Path.home() / 'scratch' / 'yubikey'))
+SSH_KEY_ROOT = Path(os.environ.get("CE_SSH_KEY_ROOT", str(Path.home() / 'scratch' / 'yubikey')))
 # Maximum number of concurrent SSH sessions to allow. This should be O(CE count)
 MAX_PROCS = int(os.environ.get("CE_MAX_PROCS", "5"))
 
@@ -57,7 +61,7 @@ def get_v1_client() -> client.CoreV1Api:
 v1 = get_v1_client()
 
 def allocate_port() -> int:
-    """ Allocate and return a free local port. """
+    """ Allocate and return a free local port. This should be called within a lock to avoid doubly-allocating the same port """
     # Ask the OS to allocate a free port by binding to port 0, then close the socket and return the allocated port.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('', 0))
@@ -112,14 +116,17 @@ def temporary_known_hosts(host_key: str):
 
 
 def get_ssh_host_key(pod_name: str, namespace: str) -> str:
-    """ Get the SSH host key for the given pod. """
+    """ Get the SSH host key for the given pod by reading its associated configmap. """
     instance_name = POD_NAME_CE_INSTANCE_RE.match(pod_name).group(1)
     configmap_name = f"{instance_name}-ssh-host-pubkey"
     configmap = v1.read_namespaced_config_map(configmap_name, namespace)
     return configmap.data['ssh_host_rsa_key.pub']
 
 def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
-    """ SSH to the given pod using the provided SSH keys. """
+    """ 
+    SSH to the given pod using the provided SSH keys. Leave the connection open indefinitely. 
+    Each call to this method should be run in a separate subprocess.
+    """
     # Port-forward the pod's SSH port to a local port.
     host_key = get_ssh_host_key(pod_name, namespace)
 
@@ -127,11 +134,11 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     # - A port-forward to the pod's SSH port
     # - An ssh-agent session with the provided keys loaded
     # - A temporary known_hosts file containing the pod's SSH host key
-    print(f"Starting SSH session for pod {pod_name}...")
+    logger.info(f"Starting SSH session for pod {pod_name}...")
     with port_forward_pod(pod_name, namespace, remote_port=22) as local_port, \
          ssh_agent_session(ssh_keys), \
          temporary_known_hosts(host_key) as known_hosts_path:
-        print("Port forwarding established, SSHing to pod...")
+        logger.info("Port forwarding established, SSHing to pod...")
         # TODO encode as many of these flags as possible into an ssh config file?
         cmd = ['ssh', 
                '-o', f'UserKnownHostsFile={known_hosts_path}', 
@@ -142,21 +149,20 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
                "echo 'Logging from inside ssh connection to pod' $(hostname)'. Connection established.'; sleep infinity"]
         Popen(cmd).wait()
     
-    print(f"SSH session to pod {pod_name} complete.")
+    logger.info(f"SSH session to pod {pod_name} complete.")
 
 
 def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     """ Wrapper around ssh_to_pod that catches and logs exceptions. """
-    print(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
+    logger.info(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
     try:
         ssh_to_pod(pod_name, namespace, ssh_keys)
     except Exception as e:
-        print(f"Error SSHing to pod {pod_name}: {e}")
+        logger.error(f"Error SSHing to pod {pod_name}: {e}")
 
 class SessionDeduplicator:
     """ Class to track active SSH sessions to avoid opening multiple sessions to the same pod. """
     active_sessions: set[str]
-    # Lock for access to active_sessions
     sessionLock: LockType
     pool: PoolType
 
@@ -169,7 +175,7 @@ class SessionDeduplicator:
         """ Attempt to start a session to the given pod. Returns True if a session was started, False if a session is already active. """
         with self.sessionLock:
             if pod_name in self.active_sessions:
-                print(f"Active session to {pod_name} already exists.")
+                logger.info(f"Active session to {pod_name} already exists.")
                 return False
             else:
                 self.active_sessions.add(pod_name)
@@ -177,16 +183,16 @@ class SessionDeduplicator:
                     try_ssh_to_pod, 
                     args=(pod_name, namespace, ssh_keys), 
                     callback=lambda _: self.end_session(pod_name),
-                    error_callback=lambda e: print(f"Error in SSH session for pod {pod_name}: {e}"))
-                print(f"Starting SSH session for {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
+                    error_callback=lambda e: logger.error(f"Error in SSH session for pod {pod_name}: {e}"))
+                logger.info(f"Starting SSH session for {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
                 return True
 
     def end_session(self, pod_name: str):
         """ End the session to the given pod. """
-        print(f"trying to end session to {pod_name}")
+        logger.info(f"trying to end session to {pod_name}")
         with self.sessionLock:
             self.active_sessions.discard(pod_name)
-            print(f"Closed SSH session to {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
+            logger.info(f"Closed SSH session to {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
 
     @property
     def _active_session_count(self) -> int:
@@ -196,25 +202,27 @@ class SessionDeduplicator:
 def main():
     """ Main event loop to watch for new CE pods and SSH to them when they are ready. """
 
-    print("Listing pods in the default namespace:")
+    logger.info("Starting CE SSH watcher...")
     w = watch.Watch()
     portLock = Lock()
+    # Open a subprocess pool, sharing the port-allocation lock among all processes
     with Pool(processes=MAX_PROCS, initializer=init_port_lock, initargs=(portLock,)) as pool:
+        # Synchronized struct to track which pods currently have active sessions
         deduplicator = SessionDeduplicator(pool)
-        for event in w.stream(v1.list_namespaced_pod, namespace="osg", label_selector="app.kubernetes.io/part-of=osg-hosted-ce"):
+
+        # Indefinitely poll the k8s API for new pod events.
+        for event in w.stream(v1.list_namespaced_pod, namespace=NAMESPACE, label_selector=LABEL_SELECTOR):
             obj = event['object']
-            print("Event: %s %s %s" % (
-                event['type'],
-                obj.kind,
-                obj.metadata.name)
-            )
+            logger.info(f"Event: {event['type']} {obj.kind} {obj.metadata.name}")
+
+            # We get all events by default, filter for events where the all the pod's containers are running.
             if obj.status and obj.status.container_statuses:
                 deleted = obj.metadata.deletion_timestamp is not None
                 running_states = [k.state.running for k in obj.status.container_statuses]
                 if all(running_states) and not deleted:
                     deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
                 elif deleted:
-                    print(f"Pod {obj.metadata.name} is marked for deletion. Not SSHing.")
+                    logger.info(f"Pod {obj.metadata.name} is marked for deletion. Not SSHing.")
 
 
 if __name__ == "__main__":
