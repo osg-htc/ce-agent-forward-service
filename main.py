@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile 
 import sys
 import time
+import socket
 
 # Namespace in which to whatch for new CE pods.
 NAMESPACE = "osg"
@@ -32,6 +33,14 @@ SSH_KEY_ROOT = Path.home() / 'scratch' / 'yubikey'
 # This should be O(CE count)
 MAX_PROCS=5
 
+# Lock for allocating ports shared among processes, in accordance with the peculiarities of
+# the Python multiprocessing library.
+# see https://stackoverflow.com/a/25558333
+portLock: LockType
+def init_port_lock(lock: LockType):
+    global portLock
+    portLock = lock
+
 def get_v1_client() -> client.CoreV1Api:
     """ Get an API client for the K8s API pointed at Tiger. """
     k8s_config = client.Configuration()
@@ -45,15 +54,26 @@ def get_v1_client() -> client.CoreV1Api:
 
 v1 = get_v1_client()
 
+def allocate_port() -> int:
+    """ Allocate and return a free local port. """
+    # Ask the OS to allocate a free port by binding to port 0, then close the socket and return the allocated port.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
 @contextmanager
-def port_forward_pod(pod_name: str, namespace: str, local_port: int, remote_port: int):
+def port_forward_pod(pod_name: str, namespace: str, remote_port: int):
     """ Port-forward the given pod's remote port to a local port within a context. """
     # TODO : Port-forwarding is non-trivial in the native Python API, for now shell out to kubectl.
-    cmd = ["kubectl", "-n", namespace, "port-forward", f"pod/{pod_name}", f"{local_port}:{remote_port}"]
-    proc = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+    with portLock:
+        local_port = allocate_port()
+        cmd = ["kubectl", "-n", namespace, "port-forward", f"pod/{pod_name}", f"{local_port}:{remote_port}"]
+        proc = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
     time.sleep(2) # Wait a moment for the port-forward to be established. TODO find a more robust way to do this.
     try:
-        yield
+        yield local_port
     finally:        
         proc.terminate()
 
@@ -104,7 +124,7 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     # - An ssh-agent session with the provided keys loaded
     # - A temporary known_hosts file containing the pod's SSH host key
     print(f"Starting SSH session for pod {pod_name}...")
-    with port_forward_pod(pod_name, namespace, local_port=2222, remote_port=22), \
+    with port_forward_pod(pod_name, namespace, remote_port=22) as local_port, \
          ssh_agent_session(ssh_keys), \
          temporary_known_hosts(host_key) as known_hosts_path:
         print("Port forwarding established, SSHing to pod...")
@@ -114,7 +134,7 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
                '-o', 'ForwardAgent=yes',
                '-o', 'IdentitiesOnly=yes',
                '-o', f'IdentityFile={SSH_KEY_ROOT}/{ssh_keys.split(",")[0]}',
-               '-p', '2222', f'{CE_USER}@localhost',
+               '-p', f'{local_port}', f'{CE_USER}@localhost',
                "echo 'Logging from inside ssh connection to pod' $(hostname)'. Connection established.'; sleep infinity"]
         Popen(cmd).wait()
     
@@ -123,7 +143,7 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
 
 def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     """ Wrapper around ssh_to_pod that catches and logs exceptions. """
-    print(f"try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
+    print(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
     try:
         ssh_to_pod(pod_name, namespace, ssh_keys)
     except Exception as e:
@@ -132,33 +152,40 @@ def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
 class SessionDeduplicator:
     """ Class to track active SSH sessions to avoid opening multiple sessions to the same pod. """
     active_sessions: set[str]
-    lock: LockType
+    # Lock for access to active_sessions
+    sessionLock: LockType
     pool: PoolType
 
     def __init__(self, pool: PoolType):
         self.active_sessions = set()
-        self.lock = Lock()
+        self.sessionLock = Lock()
         self.pool = pool
 
     def start_session(self, pod_name: str, namespace: str, ssh_keys: str) -> bool:
         """ Attempt to start a session to the given pod. Returns True if a session was started, False if a session is already active. """
-        with self.lock:
+        with self.sessionLock:
             if pod_name in self.active_sessions:
+                print(f"Active session to {pod_name} already exists.")
                 return False
             else:
                 self.active_sessions.add(pod_name)
-                self.pool.apply_async(try_ssh_to_pod, args=(pod_name, namespace, ssh_keys), callback=lambda _: self.end_session(pod_name))
+                self.pool.apply_async(
+                    try_ssh_to_pod, 
+                    args=(pod_name, namespace, ssh_keys), 
+                    callback=lambda _: self.end_session(pod_name),
+                    error_callback=lambda e: print(f"Error in SSH session for pod {pod_name}: {e}"))
+                print(f"Starting SSH session for {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
                 return True
 
     def end_session(self, pod_name: str):
         """ End the session to the given pod. """
         print(f"trying to end session to {pod_name}")
-        with self.lock:
+        with self.sessionLock:
             self.active_sessions.discard(pod_name)
-            print(f"Closed SSH session to {pod_name}. {self.active_session_count} of {MAX_PROCS} sessions used.")
+            print(f"Closed SSH session to {pod_name}. {self._active_session_count} of {MAX_PROCS} sessions used.")
 
     @property
-    def active_session_count(self) -> int:
+    def _active_session_count(self) -> int:
         """ Get the count of currently active sessions. """
         return len(self.active_sessions)
 
@@ -167,7 +194,8 @@ def main():
 
     print("Listing pods in the default namespace:")
     w = watch.Watch()
-    with Pool(processes=MAX_PROCS) as pool:
+    portLock = Lock()
+    with Pool(processes=MAX_PROCS, initializer=init_port_lock, initargs=(portLock,)) as pool:
         deduplicator = SessionDeduplicator(pool)
         for event in w.stream(v1.list_namespaced_pod, namespace="osg", label_selector="app.kubernetes.io/part-of=osg-hosted-ce"):
             obj = event['object']
@@ -180,10 +208,7 @@ def main():
                 deleted = obj.metadata.deletion_timestamp is not None
                 running_states = [k.state.running for k in obj.status.container_statuses]
                 if all(running_states) and not deleted:
-                    if deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys')):
-                        print(f"Starting SSH session for {obj.metadata.name}. {deduplicator.active_session_count} of {MAX_PROCS} sessions used.")
-                    else:
-                        print(f"Active session to {obj.metadata.name} already exists.")
+                    deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
                 elif deleted:
                     print(f"Pod {obj.metadata.name} is marked for deletion. Not SSHing.")
 
