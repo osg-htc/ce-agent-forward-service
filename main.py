@@ -15,23 +15,25 @@ import sys
 import time
 import socket
 
+# Constants for the script, configured via env
+
 # Namespace in which to whatch for new CE pods.
-NAMESPACE = "osg"
+NAMESPACE = os.environ.get("CE_NAMESPACE", "osg")
 # Label selector to filter for CE pods.
-LABEL_SELECTOR = "app.kubernetes.io/part-of=osg-hosted-ce"
+LABEL_SELECTOR = os.environ.get("CE_LABEL_SELECTOR", "app.kubernetes.io/part-of=osg-hosted-ce")
 # Username to use when SSHing to the CE pods.
-CE_USER="sshd-user"
+CE_USER = os.environ.get("CE_SSH_USER", "sshd-user")
+# SSH key root path
+SSH_KEY_ROOT = os.environ.get("CE_SSH_KEY_ROOT", str(Path.home() / 'scratch' / 'yubikey'))
+# Maximum number of concurrent SSH sessions to allow. This should be O(CE count)
+MAX_PROCS = int(os.environ.get("CE_MAX_PROCS", "5"))
+
 # Extract the socket name from the stdout of ssh-agent
 SSH_AUTH_SOCK_RE = re.compile(r'SSH_AUTH_SOCK=([^;]*);')
 # Extract the agent PID from the stdout of ssh-agent
 SSH_AGENT_PID_RE = re.compile(r'SSH_AGENT_PID=([^;]*);')
 # Extract the "instance" from a pod name ("osg-hosted-ce-<instance-name>-<replicaset-id>-<pod-id>")
 POD_NAME_CE_INSTANCE_RE = re.compile(r'osg-hosted-ce-(.*)-[a-z0-9]*-[a-z0-9]*')
-# SSH key root path
-SSH_KEY_ROOT = Path.home() / 'scratch' / 'yubikey'
-# Maximum number of concurrent SSH sessions to allow
-# This should be O(CE count)
-MAX_PROCS=5
 
 # Lock for allocating ports shared among processes, in accordance with the peculiarities of
 # the Python multiprocessing library.
