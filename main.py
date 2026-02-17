@@ -3,6 +3,7 @@
 from kubernetes import client, config, watch
 from contextlib import contextmanager
 from subprocess import Popen, PIPE
+from multiprocessing import Pool, Lock
 import signal 
 import re
 import os
@@ -22,9 +23,11 @@ SSH_AUTH_SOCK_RE = re.compile(r'SSH_AUTH_SOCK=([^;]*);')
 SSH_AGENT_PID_RE = re.compile(r'SSH_AGENT_PID=([^;]*);')
 # Extract the "instance" from a pod name ("osg-hosted-ce-<instance-name>-<replicaset-id>-<pod-id>")
 POD_NAME_CE_INSTANCE_RE = re.compile(r'osg-hosted-ce-(.*)-[a-z0-9]*-[a-z0-9]*')
-
 # SSH key root path
 SSH_KEY_ROOT = Path.home() / 'scratch' / 'yubikey'
+# Maximum number of concurrent SSH sessions to allow
+# This should be O(CE count)
+MAX_PROCS=5
 
 def get_v1_client() -> client.CoreV1Api:
     """ Get an API client for the K8s API pointed at Tiger. """
@@ -109,29 +112,40 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
                '-o', 'IdentitiesOnly=yes',
                '-o', f'IdentityFile={SSH_KEY_ROOT}/{ssh_keys.split(",")[0]}',
                '-p', '2222', f'{CE_USER}@localhost',
-               "echo 'hello world!'"]
+               "echo 'Logging from inside ssh connection to pod' $(hostname)'. Connection established.'; sleep infinity"]
         Popen(cmd).wait()
     
-    print("SSH session complete.")
+    print(f"SSH session to pod {pod_name} complete.")
+
+def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
+    """ Wrapper around ssh_to_pod that catches and logs exceptions. """
+    try:
+        ssh_to_pod(pod_name, namespace, ssh_keys)
+    except Exception as e:
+        print(f"Error SSHing to pod {pod_name}: {e}")
 
 def main():
     """ Main event loop to watch for new CE pods and SSH to them when they are ready. """
 
     print("Listing pods in the default namespace:")
     w = watch.Watch()
-    for event in w.stream(v1.list_namespaced_pod, namespace="osg", label_selector="app.kubernetes.io/part-of=osg-hosted-ce"):
-        obj = event['object']
-        print("Event: %s %s %s" % (
-            event['type'],
-            obj.kind,
-            obj.metadata.name)
-        )
-        if obj.status and obj.status.container_statuses:
-            running_states = [k.state.running for k in obj.status.container_statuses]
-            if all(running_states):
-                print(f"All containers in pod {obj.metadata.name} are running!")
-                print(f"Keys to use: {obj.metadata.annotations.get('osg-htc.org/ssh-keys')}")
-                ssh_to_pod(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
+    with Pool(processes=MAX_PROCS) as pool:
+        for event in w.stream(v1.list_namespaced_pod, namespace="osg", label_selector="app.kubernetes.io/part-of=osg-hosted-ce"):
+            obj = event['object']
+            print("Event: %s %s %s" % (
+                event['type'],
+                obj.kind,
+                obj.metadata.name)
+            )
+            if obj.status and obj.status.container_statuses:
+                deleted = obj.metadata.deletion_timestamp is not None
+                running_states = [k.state.running for k in obj.status.container_statuses]
+                if all(running_states) and not deleted:
+                    print(f"All containers in pod {obj.metadata.name} are running!")
+                    print(f"Keys to use: {obj.metadata.annotations.get('osg-htc.org/ssh-keys')}")
+                    pool.apply_async(try_ssh_to_pod, args=(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys')))
+                elif deleted:
+                    print(f"Pod {obj.metadata.name} is marked for deletion. Not SSHing.")
 
 
 if __name__ == "__main__":
