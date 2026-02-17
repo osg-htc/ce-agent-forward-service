@@ -71,7 +71,9 @@ def port_forward_pod(pod_name: str, namespace: str, remote_port: int):
         local_port = allocate_port()
         cmd = ["kubectl", "-n", namespace, "port-forward", f"pod/{pod_name}", f"{local_port}:{remote_port}"]
         proc = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-    time.sleep(2) # Wait a moment for the port-forward to be established. TODO find a more robust way to do this.
+        # Wait a moment for the port-forward to be established. 
+        # TODO read the proc's stdout to confirm this rather than just waiting.
+        time.sleep(2)
     try:
         yield local_port
     finally:        
