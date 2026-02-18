@@ -18,16 +18,10 @@ import time
 import socket
 import logging
 from k8s_utils import get_ssh_host_key, pod_name_is_ready
+from config import CE_USER, SSH_KEY_ROOT
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
-
-# Constants for the script, configured via env
-
-# Username to use when SSHing to the CE pods.
-CE_USER = os.environ.get("CE_SSH_USER", "sshd-user")
-# SSH key root path
-SSH_KEY_ROOT = Path(os.environ.get("CE_SSH_KEY_ROOT", str(Path.home() / 'scratch' / 'yubikey')))
 
 # Extract the socket name from the stdout of ssh-agent
 SSH_AUTH_SOCK_RE = re.compile(r'SSH_AUTH_SOCK=([^;]*);')

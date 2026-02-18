@@ -15,18 +15,10 @@ import sys
 import logging
 from k8s_utils import v1_client, pod_is_ready
 from ssh_worker import try_ssh_to_pod, init_port_lock
+from config import NAMESPACE, LABEL_SELECTOR, MAX_PROCS
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
-
-# Constants for the script, configured via env
-
-# Namespace in which to whatch for new CE pods.
-NAMESPACE = os.environ.get("CE_NAMESPACE", "osg")
-# Label selector to filter for CE pods.
-LABEL_SELECTOR = os.environ.get("CE_LABEL_SELECTOR", "app.kubernetes.io/part-of=osg-hosted-ce")
-# Maximum number of concurrent SSH sessions to allow. This should be O(CE count)
-MAX_PROCS = int(os.environ.get("CE_MAX_PROCS", "5"))
 
 # Extract the socket name from the stdout of ssh-agent
 SSH_AUTH_SOCK_RE = re.compile(r'SSH_AUTH_SOCK=([^;]*);')
