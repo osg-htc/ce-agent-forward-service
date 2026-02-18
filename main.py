@@ -11,10 +11,9 @@ from multiprocessing.pool import Pool as PoolType
 from multiprocessing.synchronize import Lock as LockType
 import re
 import os
-from pathlib import Path
 import sys
 import logging
-from k8s_utils import v1
+from k8s_utils import v1_client, pod_is_ready
 from ssh_worker import try_ssh_to_pod, init_port_lock
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -85,18 +84,13 @@ def main():
         deduplicator = SessionDeduplicator(pool)
 
         # Indefinitely poll the k8s API for new pod events.
-        for event in w.stream(v1.list_namespaced_pod, namespace=NAMESPACE, label_selector=LABEL_SELECTOR):
+        for event in w.stream(v1_client.list_namespaced_pod, namespace=NAMESPACE, label_selector=LABEL_SELECTOR):
             obj = event['object']
             logger.info(f"Event: {event['type']} {obj.kind} {obj.metadata.name}")
 
             # We get all events by default, filter for events where the all the pod's containers are running.
-            if obj.status and obj.status.container_statuses:
-                deleted = obj.metadata.deletion_timestamp is not None
-                running_states = [k.state.running for k in obj.status.container_statuses]
-                if all(running_states) and not deleted:
-                    deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
-                elif deleted:
-                    logger.info(f"Pod {obj.metadata.name} is marked for deletion. Not SSHing.")
+            if pod_is_ready(obj):
+                deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
 
 
 if __name__ == "__main__":

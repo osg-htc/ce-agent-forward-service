@@ -20,12 +20,29 @@ def get_v1_client() -> client.CoreV1Api:
     v1 = client.CoreV1Api(api_client=api_client)
     return v1
 
-v1 = get_v1_client()
+v1_client = get_v1_client()
 
 def get_ssh_host_key(pod_name: str, namespace: str) -> str:
     """ Get the SSH host key for the given pod by reading its associated configmap. """
     instance_name = POD_NAME_CE_INSTANCE_RE.match(pod_name).group(1)
     configmap_name = f"{instance_name}-ssh-host-pubkey"
-    configmap = v1.read_namespaced_config_map(configmap_name, namespace)
+    configmap = v1_client.read_namespaced_config_map(configmap_name, namespace)
     return configmap.data['ssh_host_rsa_key.pub']
 
+def pod_is_ready(pod) -> bool:
+    """ Return whether all containers in a pod are 'running', and the pod is not marked for deletion. """
+    # We get all events by default, filter for events where the all the pod's containers are running.
+    if pod and pod.status and pod.status.container_statuses:
+        deleted = pod.metadata.deletion_timestamp is not None
+        running_states = [k.state.running for k in pod.status.container_statuses]
+        return all(running_states) and not deleted
+    return False
+
+def pod_name_is_ready(name, namespace) -> bool:
+    """ Return whether all containers in a pod with the given name are 'running', and the pod is not marked for deletion. """
+    try:
+        pod = v1_client.read_namespaced_pod(name, namespace)
+        return pod_is_ready(pod)
+    except client.exceptions.ApiException as e:
+        logger.error(f"Error checking if pod {name} in {namespace} is ready: {e}")
+        return False

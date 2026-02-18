@@ -17,7 +17,7 @@ import sys
 import time
 import socket
 import logging
-from k8s_utils import get_ssh_host_key
+from k8s_utils import get_ssh_host_key, pod_name_is_ready
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
@@ -67,6 +67,14 @@ def port_forward_pod(pod_name: str, namespace: str, remote_port: int):
     finally:        
         proc.terminate()
 
+def stop_ssh_agent():
+    """ Stop the ssh-agent process if it's still running. """
+    if 'SSH_AGENT_PID' in os.environ:
+        try:
+            os.kill(int(os.environ['SSH_AGENT_PID']), signal.SIGTERM)
+        except ProcessLookupError:
+            logger.info("SSH agent process already terminated.")
+
 @contextmanager
 def ssh_agent_session(ssh_key_paths: str):
     """ Run the context within an eval $(ssh-agent), closing the agent at the end """
@@ -86,7 +94,7 @@ def ssh_agent_session(ssh_key_paths: str):
             Popen(['ssh-add', SSH_KEY_ROOT / ssh_key_path]).wait()
         yield
     finally:
-        os.kill(int(os.environ['SSH_AGENT_PID']), signal.SIGTERM)
+        stop_ssh_agent()
 
 @contextmanager
 def temporary_known_hosts(host_key: str):
@@ -130,7 +138,12 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
 def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     """ Wrapper around ssh_to_pod that catches and logs exceptions. Entrypoint for subprocesses. """
     logger.info(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
-    try:
-        ssh_to_pod(pod_name, namespace, ssh_keys)
-    except Exception as e:
-        logger.error(f"Error SSHing to pod {pod_name}: {e}")
+    signal.signal(signal.SIGINT, stop_ssh_agent)
+    # Keep trying to ssh to the pod until it no longer exists, in the case of unexpected disconnects
+    while pod_name_is_ready(pod_name, namespace):
+        try:
+            ssh_to_pod(pod_name, namespace, ssh_keys)
+        except Exception as e:
+            logger.error(f"Error SSHing to pod {pod_name}: {e}")
+        logger.info(f"SSH session to pod {pod_name} ended, checking if pod is still ready...")
+        time.sleep(5)
