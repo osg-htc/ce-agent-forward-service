@@ -13,7 +13,7 @@ import re
 import os
 import sys
 import logging
-from k8s_utils import v1_client, pod_is_ready
+from k8s_utils import v1_client, pod_is_ready, get_key_name_for_pod
 from ssh_worker import try_ssh_to_pod, init_port_lock
 from config import NAMESPACE, LABEL_SELECTOR, MAX_PROCS
 
@@ -81,8 +81,15 @@ def main():
             logger.info(f"Event: {event['type']} {obj.kind} {obj.metadata.name}")
 
             # We get all events by default, filter for events where the all the pod's containers are running.
-            if pod_is_ready(obj):
-                deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, obj.metadata.annotations.get('osg-htc.org/ssh-keys'))
+            if not pod_is_ready(obj):
+                continue
+            
+            key_name = get_key_name_for_pod(obj.metadata.name, NAMESPACE)
+            if not key_name:
+                logger.warning(f"No key mapping found for pod {obj.metadata.name}. Skipping.")
+                continue
+
+            deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, key_name)
 
 
 if __name__ == "__main__":

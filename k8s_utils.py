@@ -2,6 +2,8 @@ import re
 from kubernetes import client, config, watch
 import logging
 import sys
+import yaml
+from config import KEY_MAPPING_CONFIGMAP
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
@@ -28,6 +30,22 @@ def get_ssh_host_key(pod_name: str, namespace: str) -> str:
     configmap_name = f"{instance_name}-ssh-host-pubkey"
     configmap = v1_client.read_namespaced_config_map(configmap_name, namespace)
     return configmap.data['ssh_host_rsa_key.pub']
+
+
+def get_key_name_for_pod(pod_name: str, namespace: str) -> str:
+    """ Get the SSH key that should be forwarded to the pod with the given name.
+    Key mapping is expected to be stored in a ConfigMap that's created independently
+    of the helm chart.
+    """
+    instance_name = POD_NAME_CE_INSTANCE_RE.match(pod_name).group(1)
+    configmap = v1_client.read_namespaced_config_map(KEY_MAPPING_CONFIGMAP, namespace)
+    key_mappings = yaml.load(configmap.data['key-mappings.yaml'], Loader=yaml.Loader)
+    instances : dict[str, str] = key_mappings['instances']
+    for key_name, instance in instances.items():
+        if instance == instance_name:
+            return key_name
+    return None
+
 
 def pod_is_ready(pod) -> bool:
     """ Return whether all containers in a pod are 'running', and the pod is not marked for deletion. """
