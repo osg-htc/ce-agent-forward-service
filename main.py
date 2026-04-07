@@ -11,10 +11,11 @@ import sys
 from multiprocessing import Lock, Pool
 from multiprocessing.pool import Pool as PoolType
 from multiprocessing.synchronize import Lock as LockType
+from typing import Any
 
 from kubernetes import watch
 
-from config import LABEL_SELECTOR, MAX_PROCS, NAMESPACE
+from config import LABEL_SELECTOR, MAX_PROCS, NAMESPACE, KEY_TYPE
 from k8s_utils import get_key_name_for_pod, pod_is_ready, v1_client
 from ssh_worker import init_port_lock, try_ssh_to_pod
 
@@ -39,7 +40,7 @@ class SessionDeduplicator:
         self.sessionLock = Lock()
         self.pool = pool
 
-    def start_session(self, pod_name: str, namespace: str, ssh_keys: str) -> bool:
+    def start_session(self, pod_name: str, namespace: str, ssh_keys: str, remote_port: int) -> bool:
         """Attempt to start a session to the given pod. Returns True if a session was started, False if a session is already active."""
         with self.sessionLock:
             if pod_name in self.active_sessions:
@@ -49,7 +50,7 @@ class SessionDeduplicator:
                 self.active_sessions.add(pod_name)
                 self.pool.apply_async(
                     try_ssh_to_pod,
-                    args=(pod_name, namespace, ssh_keys),
+                    args=(pod_name, namespace, ssh_keys, remote_port),
                     callback=lambda _: self.end_session(pod_name),
                     error_callback=lambda e: logger.error(
                         f"Error in SSH session for pod {pod_name}: {e}"
@@ -94,23 +95,23 @@ def main():
             namespace=NAMESPACE,
             label_selector=LABEL_SELECTOR,
         ):
-            obj = event["object"]
+            obj : Any = event["object"]
             logger.info(f"Event: {event['type']} {obj.kind} {obj.metadata.name}")
 
             # We get all events by default, filter for events where the all the pod's containers are running.
             if not pod_is_ready(obj):
                 continue
 
-            key_name = get_key_name_for_pod(obj.metadata.name, NAMESPACE)
+            key_name = get_key_name_for_pod(obj)
             if not key_name:
                 logger.warning(
                     f"No key mapping found for pod {obj.metadata.name}. Skipping."
                 )
                 continue
 
-            deduplicator.start_session(
-                obj.metadata.name, obj.metadata.namespace, key_name
-            )
+            
+            remote_port = 22 if KEY_TYPE == "primary" else 23
+            deduplicator.start_session(obj.metadata.name, obj.metadata.namespace, key_name, remote_port)
 
 
 if __name__ == "__main__":

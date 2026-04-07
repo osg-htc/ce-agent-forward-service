@@ -4,8 +4,9 @@ import sys
 
 import yaml
 from kubernetes import client, config
+from typing import Any
 
-from config import KEY_MAPPING_CONFIGMAP
+from config import KEY_TYPE
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
@@ -37,19 +38,11 @@ def get_ssh_host_key(pod_name: str, namespace: str) -> str:
     return configmap.data["ssh_host_rsa_key.pub"]
 
 
-def get_key_name_for_pod(pod_name: str, namespace: str) -> str:
+def get_key_name_for_pod(pod: Any) -> str | None:
     """Get the SSH key that should be forwarded to the pod with the given name.
-    Key mapping is expected to be stored in a ConfigMap that's created independently
-    of the helm chart.
+    Key mapping is expected to be stored in the pod's labels.
     """
-    instance_name = POD_NAME_CE_INSTANCE_RE.match(pod_name).group(1)
-    configmap = v1_client.read_namespaced_config_map(KEY_MAPPING_CONFIGMAP, namespace)
-    key_mappings = yaml.load(configmap.data["key-mappings.yaml"], Loader=yaml.Loader)
-    instances: dict[str, str] = key_mappings["instances"]
-    for key_name, instance in instances.items():
-        if instance == instance_name:
-            return key_name
-    return None
+    return pod.metadata.labels.get(f"osg-htc.org/{KEY_TYPE}-key", None)
 
 
 def pod_is_ready(pod) -> bool:

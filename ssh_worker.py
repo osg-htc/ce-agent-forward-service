@@ -81,6 +81,8 @@ def stop_ssh_agent():
         except ProcessLookupError:
             logger.info("SSH agent process already terminated.")
 
+def handle_stop_ssh_agent(signal, frame):
+    stop_ssh_agent()
 
 @contextmanager
 def ssh_agent_session(ssh_key_paths: str):
@@ -113,7 +115,7 @@ def temporary_known_hosts(host_key: str):
         yield f.name
 
 
-def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
+def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str, remote_port=22):
     """
     SSH to the given pod using the provided SSH keys. Leave the connection open indefinitely.
     Each call to this method should be run in a separate subprocess.
@@ -127,7 +129,7 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     # - A temporary known_hosts file containing the pod's SSH host key
     logger.info(f"Starting SSH session for pod {pod_name}...")
     with (
-        port_forward_pod(pod_name, namespace, remote_port=22) as local_port,
+        port_forward_pod(pod_name, namespace, remote_port=remote_port) as local_port,
         ssh_agent_session(ssh_keys),
         temporary_known_hosts(host_key) as known_hosts_path,
     ):
@@ -153,14 +155,14 @@ def ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
     logger.info(f"SSH session to pod {pod_name} complete.")
 
 
-def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str):
+def try_ssh_to_pod(pod_name: str, namespace: str, ssh_keys: str, remote_port: int = 22):
     """Wrapper around ssh_to_pod that catches and logs exceptions. Entrypoint for subprocesses."""
-    logger.info(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys}")
-    signal.signal(signal.SIGINT, stop_ssh_agent)
+    logger.info(f"Try ssh to pod {pod_name} in {namespace} with keys {ssh_keys} to port {remote_port}")
+    signal.signal(signal.SIGINT, handle_stop_ssh_agent)
     # Keep trying to ssh to the pod until it no longer exists, in the case of unexpected disconnects
     while pod_name_is_ready(pod_name, namespace):
         try:
-            ssh_to_pod(pod_name, namespace, ssh_keys)
+            ssh_to_pod(pod_name, namespace, ssh_keys, remote_port)
         except Exception as e:
             logger.error(f"Error SSHing to pod {pod_name}: {e}")
         logger.info(

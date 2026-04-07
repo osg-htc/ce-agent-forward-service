@@ -8,10 +8,10 @@ NAMESPACE = os.environ.get("CE_NAMESPACE", "osg")
 LABEL_SELECTOR = os.environ.get(
     "CE_LABEL_SELECTOR", "app.kubernetes.io/part-of=osg-hosted-ce"
 )
-# ConfigMap containing instance -> key name mappings
-KEY_MAPPING_CONFIGMAP = os.environ.get("CE_KEY_CONFIGMAP", "hosted-ce-key-mappings")
 # Maximum number of concurrent SSH sessions to allow. This should be O(CE count)
 MAX_PROCS = int(os.environ.get("CE_MAX_PROCS", "5"))
+# Which key from a pod's annotations to use. "primary" | "secondary"
+KEY_TYPE = os.environ.get("CE_KEY_TYPE", "primary")
 # Username to use when SSHing to the CE pods.
 CE_USER = os.environ.get("CE_SSH_USER", "sshd-user")
 # SSH key root path
