@@ -15,7 +15,7 @@ from typing import Any
 
 from kubernetes import watch
 
-from config import LABEL_SELECTOR, MAX_PROCS, NAMESPACE, KEY_TYPE
+from config import K8S_CONNECT_TIMEOUT, K8S_WATCH_TIMEOUT, LABEL_SELECTOR, MAX_PROCS, NAMESPACE, KEY_TYPE
 from k8s_utils import get_key_name_for_pod, pod_is_ready, v1_client
 from ssh_worker import init_port_lock, try_ssh_to_pod
 
@@ -89,11 +89,14 @@ def main():
         # Synchronized struct to track which pods currently have active sessions
         deduplicator = SessionDeduplicator(pool)
 
-        # Indefinitely poll the k8s API for new pod events.
+        # Indefinitely poll the k8s API for new pod events. If the connection hangs or
+        # goes quiet for longer than the watch timeout, this raises and the process exits;
+        # systemd (Restart=on-failure) is responsible for restarting it, not this loop.
         for event in w.stream(
             v1_client.list_namespaced_pod,
             namespace=NAMESPACE,
             label_selector=LABEL_SELECTOR,
+            _request_timeout=(K8S_CONNECT_TIMEOUT, K8S_WATCH_TIMEOUT),
         ):
             obj : Any = event["object"]
             logger.info(f"Event: {event['type']} {obj.kind} {obj.metadata.name}")

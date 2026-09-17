@@ -18,3 +18,9 @@ CE_USER = os.environ.get("CE_SSH_USER", "sshd-user")
 SSH_KEY_ROOT = Path(
     os.environ.get("CE_SSH_KEY_ROOT", str(Path.home() / "scratch" / "yubikey"))
 )
+# Timeout (seconds) for establishing a TCP connection to the Kubernetes API server.
+K8S_CONNECT_TIMEOUT = int(os.environ.get("CE_K8S_CONNECT_TIMEOUT", "10"))
+# Timeout (seconds) to wait for a response to a single (non-streaming) Kubernetes API call.
+K8S_READ_TIMEOUT = int(os.environ.get("CE_K8S_READ_TIMEOUT", "30"))
+# Timeout (seconds) to wait for an event on the pod watch stream before reconnecting.
+K8S_WATCH_TIMEOUT = int(os.environ.get("CE_K8S_WATCH_TIMEOUT", "300"))
