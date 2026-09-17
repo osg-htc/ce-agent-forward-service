@@ -1,0 +1,35 @@
+[Unit]
+Description=CE agent-forwarder: watches Kubernetes CE pods and maintains SSH agent-forwarding sessions to them
+After=network-online.target
+Wants=network-online.target
+# Widened to accommodate the exponential backoff below without systemd giving up
+# and marking the unit permanently failed during an extended cluster/network outage.
+StartLimitIntervalSec=1h
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=ce-agent-forward
+Group=ce-agent-forward
+WorkingDirectory=/usr/libexec/ce-agent-forward-service
+EnvironmentFile=-/etc/sysconfig/ce-agent-forward-service
+ExecStart=/usr/bin/python3 /usr/libexec/ce-agent-forward-service/main.py
+# main.py does not retry internally -- any unhandled error (a hung/broken watch,
+# an API server outage, etc.) is expected to crash the process, and restart/backoff
+# is handled entirely here: start at RestartSec, growing over RestartSteps up to
+# RestartMaxDelaySec.
+Restart=on-failure
+RestartSec=5s
+RestartSteps=10
+RestartMaxDelaySec=5min
+KillMode=control-group
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/ce-agent-forward-service
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

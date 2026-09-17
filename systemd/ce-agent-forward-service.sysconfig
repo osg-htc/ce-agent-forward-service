@@ -1,0 +1,37 @@
+# Environment overrides for ce-agent-forward-service.
+# See config.py in the project source for the full list of recognized variables.
+
+# Namespace in which to watch for CE pods.
+#CE_NAMESPACE=osg
+
+# Label selector used to filter for CE pods.
+#CE_LABEL_SELECTOR=app.kubernetes.io/part-of=osg-hosted-ce
+
+# Maximum number of concurrent SSH sessions to allow (should be O(CE count)).
+#CE_MAX_PROCS=5
+
+# Which annotated key to forward to each pod: "primary" or "secondary".
+#CE_KEY_TYPE=primary
+
+# Username to use when SSHing into the CE pods.
+#CE_SSH_USER=sshd-user
+
+# Directory containing the SSH private keys referenced by pod annotations.
+CE_SSH_KEY_ROOT=/var/lib/ce-agent-forward-service/keys
+
+# Path to the kubeconfig used to talk to the Kubernetes API.
+KUBECONFIG=/var/lib/ce-agent-forward-service/.kube/config
+
+# HTTP proxy settings, if this host requires a proxy to reach the outside
+# world but the Kubernetes API server should be reached directly. Unlike an
+# interactive shell, systemd services do not inherit the login environment's
+# proxy configuration, so any proxy exemption needed for the API server host
+# must be repeated here. Note that EnvironmentFile= does not do shell
+# variable expansion, so the upper- and lowercase forms must each be set to
+# the same literal value if both are needed.
+#HTTP_PROXY=http://proxy.example.org:3128
+#http_proxy=http://proxy.example.org:3128
+#HTTPS_PROXY=http://proxy.example.org:3128
+#https_proxy=http://proxy.example.org:3128
+#NO_PROXY=localhost,127.0.0.1,.example.org,k8s-api-server.example.org
+#no_proxy=localhost,127.0.0.1,.example.org,k8s-api-server.example.org

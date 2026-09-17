@@ -1,0 +1,10 @@
+# Grant the ce-agent-forward-service user access to hardware security keys
+# (YubiKey / FIDO2-SK) used to sign the ED25519-SK keys forwarded to CE pods.
+#
+# EL's systemd-udev ships 60-fido-id.rules, which tags a hidraw device as
+# "security-device" once it probes as a real FIDO/U2F token, but (unlike
+# desktop-oriented distros) ships no rule that actually grants access based
+# on that tag -- the "uaccess" mechanism is seat/session-based and doesn't
+# apply to a headless systemd service anyway. This rule grants persistent
+# group-based access instead.
+SUBSYSTEM=="hidraw", TAG=="security-device", GROUP="ce-agent-forward", MODE="0660"
